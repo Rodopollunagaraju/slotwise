@@ -1,0 +1,55 @@
+{
+  "name": "slotwise",
+  "version": "1.0.0",
+  "description": "Multi-tenant Salon Booking SaaS with Concurrency-safe Booking and Payments",
+  "main": "dist/src/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "migrate": "ts-node src/db/migrate.ts",
+    "seed": "ts-node src/db/seed.ts",
+    "test": "jest --runInBand --detectOpenHandles --forceExit",
+    "test:watch": "jest --watch",
+    "stress-test": "ts-node scripts/stress-test-concurrency.ts",
+    "demo": "ts-node scripts/live-demo.ts"
+  },
+  "keywords": [
+    "saas",
+    "multi-tenant",
+    "booking",
+    "postgresql",
+    "exclusion-constraint",
+    "redis",
+    "payments",
+    "concurrency"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.12.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/node": "^20.14.9",
+    "@types/pg": "^8.11.6",
+    "@types/supertest": "^6.0.2",
+    "@types/uuid": "^10.0.0",
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0",
+    "ts-jest": "^29.1.5",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.2"
+  }
+}

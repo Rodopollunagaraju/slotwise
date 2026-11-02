@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: slotwise_nginx_gateway
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: slotwise_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: slotwise_user
+      POSTGRES_PASSWORD: slotwise_secret
+      POSTGRES_DB: slotwise_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slotwise_user -d slotwise_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: slotwise_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.22.1
+    container_name: slotwise_pgbouncer
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: slotwise_user
+      DB_PASSWORD: slotwise_secret
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: slotwise_db
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: slotwise_api
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      DATABASE_URL: postgres://slotwise_user:slotwise_secret@postgres:5432/slotwise_db
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super_secure_slotwise_jwt_secret_key_12345
+    ports:
+      - "4000:4000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: slotwise_worker
+    restart: always
+    command: ["node", "dist/jobs/worker-entry.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://slotwise_user:slotwise_secret@postgres:5432/slotwise_db
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super_secure_slotwise_jwt_secret_key_12345
+
+volumes:
+  postgres_data:
+  redis_data:
