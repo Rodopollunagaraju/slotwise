@@ -1,4 +1,30 @@
+/**
+ * ============================================================================
+ * SlotWise — Real-time Slot Availability Engine (with Stampede Protection)
+ * ============================================================================
+ * 
+ * CORE ALGORITHM & PERFORMANCE:
+ * Computing real-time appointment slots involves:
+ * 1. Fetching service duration and post-service buffer minutes.
+ * 2. Querying all staff members mapped to this service.
+ * 3. Checking staff working hours for that specific day of the week.
+ * 4. Filtering out staff members with approved time-off / vacations.
+ * 5. Checking all existing PENDING and CONFIRMED bookings on that date.
+ * 6. Iterating through the day in 30-min intervals and evaluating overlap:
+ *    `slot_start < booking_end && slot_end > booking_start`
+ * 
+ * CACHING & STAMPEDE MITIGATION:
+ * Because this calculation involves multiple joins and interval math,
+ * we cache computed slots in Redis for 30 seconds with key:
+ * `tenant:{tenantId}:slots:{serviceId}:{date}:{staffId || 'all'}`
+ * 
+ * With Single-Flight Mutex (`cacheService.getOrSet()`), concurrent bursts
+ * (e.g. 100 users loading the appointment page at once) only perform the
+ * calculation once, serving all 99 other requests from the shared promise/cache!
+ */
+
 import { db } from '../../config/database';
+import { cacheService } from '../../services/cache.service';
 
 export interface AvailableSlot {
   staffId: string;
@@ -12,6 +38,10 @@ export interface AvailableSlot {
 }
 
 export class SlotService {
+  /**
+   * Computes available appointment slots for a customer.
+   * Leverages Redis cache-aside with Single-Flight Stampede protection.
+   */
   async getAvailableSlots(tenantId: string, params: {
     serviceId: string;
     date: string; // YYYY-MM-DD
@@ -20,7 +50,33 @@ export class SlotService {
   }): Promise<AvailableSlot[]> {
     const { serviceId, date, staffId, slotIntervalMin = 30 } = params;
 
-    // 1. Fetch service
+    // Cache key incorporates tenant, service, date, and staff filter
+    const cacheKey = cacheService.buildKey(
+      tenantId,
+      'slots',
+      serviceId,
+      date,
+      staffId || 'all',
+      String(slotIntervalMin)
+    );
+
+    // Cache with a 30-second TTL + Single-Flight protection
+    return await cacheService.getOrSet(cacheKey, 30, async () => {
+      return await this.computeSlotsFromDb(tenantId, serviceId, date, staffId, slotIntervalMin);
+    });
+  }
+
+  /**
+   * Performs the database queries and temporal interval calculation.
+   */
+  private async computeSlotsFromDb(
+    tenantId: string,
+    serviceId: string,
+    date: string,
+    staffId?: string,
+    slotIntervalMin = 30
+  ): Promise<AvailableSlot[]> {
+    // 1. Fetch service details
     const serviceRes = await db.query(
       'SELECT * FROM services WHERE tenant_id = $1 AND id = $2 AND is_active = TRUE',
       [tenantId, serviceId]
@@ -33,7 +89,7 @@ export class SlotService {
     }
     const service = serviceRes.rows[0];
 
-    // 2. Identify eligible staff
+    // 2. Identify eligible staff members offering this service
     let staffQuery = `
       SELECT s.id, s.display_name, ss.custom_duration_min, ss.custom_price
       FROM staff s
@@ -54,28 +110,27 @@ export class SlotService {
       return [];
     }
 
-    // Determine target day of week (0 = Sunday, 1 = Monday, ...)
-    // Parse target date
+    // Determine target day of week (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
     const [year, month, day] = date.split('-').map(Number);
     const targetDate = new Date(Date.UTC(year, month - 1, day));
     const dayOfWeek = targetDate.getUTCDay();
 
     const availableSlots: AvailableSlot[] = [];
 
-    // 3. For each staff member, check schedule, time off, and bookings
+    // 3. For each eligible staff member, check schedule, time off, and bookings
     for (const member of eligibleStaff) {
-      // Check time off
+      // Check time off / vacation
       const timeOffRes = await db.query(
         `SELECT * FROM time_off
          WHERE staff_id = $1 AND $2::date BETWEEN start_date AND end_date`,
         [member.id, date]
       );
       if (timeOffRes.rows.length > 0) {
-        // Staff member is on vacation/leave today
+        // Staff member is on approved leave today
         continue;
       }
 
-      // Check working hours
+      // Check weekly working hours
       const availabilityRes = await db.query(
         `SELECT * FROM availability
          WHERE staff_id = $1 AND day_of_week = $2 AND is_active = TRUE`,
@@ -104,7 +159,7 @@ export class SlotService {
       const buffer = service.buffer_after_min || 0;
       const price = member.custom_price || service.price;
 
-      // Iterate through availability windows
+      // Iterate through working hour shifts (e.g., 09:00 - 17:00)
       for (const window of availabilityRes.rows) {
         const [startH, startM] = window.start_time.split(':').map(Number);
         const [endH, endM] = window.end_time.split(':').map(Number);
@@ -118,19 +173,19 @@ export class SlotService {
           const currentSlotEnd = new Date(currentSlotStart.getTime() + duration * 60 * 1000);
           const currentSlotWithBuffer = new Date(currentSlotStart.getTime() + (duration + buffer) * 60 * 1000);
 
-          // Check if slot exceeds working hours window
+          // Check if slot exceeds working shift
           if (currentSlotEnd.getTime() > windowEnd.getTime()) {
             break;
           }
 
-          // Check collision with existing active bookings
+          // Evaluate collision with existing active bookings
           const hasConflict = existingBookings.some((b) => {
             const bStart = new Date(b.start_at).getTime();
             const bEnd = new Date(b.end_at).getTime();
             const sStart = currentSlotStart.getTime();
             const sEnd = currentSlotWithBuffer.getTime();
 
-            // Overlap check
+            // Interval overlap condition: start1 < end2 AND start2 < end1
             return sStart < bEnd && sEnd > bStart;
           });
 
@@ -147,7 +202,7 @@ export class SlotService {
             });
           }
 
-          // Advance to next slot interval
+          // Advance to next slot interval (e.g. +30 mins)
           currentSlotStart = new Date(currentSlotStart.getTime() + slotIntervalMin * 60 * 1000);
         }
       }

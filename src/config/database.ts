@@ -233,7 +233,12 @@ export class Database {
       }
 
       if (upper.includes('FROM OUTBOX')) {
-        let results = memoryDb.outbox.filter(o => o.status === 'PENDING');
+        let results = [...memoryDb.outbox];
+        if (upper.includes('WHERE ID = $1')) {
+          results = results.filter(o => o.id === params[0]);
+        } else if (upper.includes("STATUS = 'PENDING'")) {
+          results = results.filter(o => o.status === 'PENDING');
+        }
         return { rows: results as any[], rowCount: results.length };
       }
     }
@@ -421,18 +426,31 @@ export class Database {
       let aggregateType = 'BOOKING';
       let aggregateId = params[1];
       let eventType = 'booking.created';
-      let payload = params[2];
+      // The payload is always the final parameter passed
+      let payload = params[params.length - 1];
 
       if (params.length >= 5) {
         aggregateType = params[1];
         aggregateId = params[2];
         eventType = params[3];
-        payload = params[4];
       } else {
-        // Extract literal event_type from SQL if present
-        const match = cleanSql.match(/'(booking\.[a-z\.]+)'/i);
-        if (match) {
-          eventType = match[1];
+        // Extract literal aggregate_id or event_type if embedded in SQL
+        const evtMatch = cleanSql.match(/'(booking\.[a-z\._]+)'/i);
+        if (evtMatch) {
+          eventType = evtMatch[1];
+        }
+        const aggMatch = cleanSql.match(/'([a-zA-Z0-9_\-]+)'/g);
+        if (aggMatch && aggMatch.length >= 2) {
+          aggregateType = aggMatch[0].replace(/'/g, '');
+        }
+      }
+
+      let parsedPayload = payload;
+      if (typeof payload === 'string') {
+        try {
+          parsedPayload = JSON.parse(payload);
+        } catch {
+          parsedPayload = payload;
         }
       }
 
@@ -442,7 +460,7 @@ export class Database {
         aggregate_type: aggregateType,
         aggregate_id: aggregateId,
         event_type: eventType,
-        payload: typeof payload === 'string' ? JSON.parse(payload) : payload,
+        payload: parsedPayload,
         status: 'PENDING',
         retry_count: 0,
         last_error: null,
@@ -546,8 +564,16 @@ export class Database {
       const id = params[params.length - 1];
       const item = memoryDb.outbox.find(o => o.id === id);
       if (item) {
-        item.status = params[0];
-        item.published_at = new Date();
+        if (upper.includes('PUBLISHED')) {
+          item.status = 'PUBLISHED';
+          item.published_at = new Date();
+        } else if (upper.includes('RETRY_COUNT')) {
+          item.retry_count = (item.retry_count || 0) + 1;
+          item.last_error = params[0];
+        } else {
+          item.status = params[0];
+          item.published_at = new Date();
+        }
         return { rows: [item] as any[], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };

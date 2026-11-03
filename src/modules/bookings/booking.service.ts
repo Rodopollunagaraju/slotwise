@@ -1,48 +1,76 @@
-import { db } from '../../config/database';
+/**
+ * ============================================================================
+ * SlotWise — Concurrency-Guarded Booking Service & State Machine
+ * ============================================================================
+ * 
+ * CORE ARCHITECTURAL INVARIANTS:
+ * 
+ * 1. ZERO DOUBLE BOOKING (POSTGRESQL EXCLUSION CONSTRAINT):
+ *    No application-level check can reliably prevent race conditions when two
+ *    concurrent requests attempt to reserve the same stylist for the same slot.
+ *    SlotWise executes `INSERT INTO bookings` inside an ACID transaction.
+ *    PostgreSQL's GiST index evaluates temporal range overlap (`&&`) at the engine level.
+ *    If an overlap occurs, code `23P01` (`exclusion_violation`) is thrown and
+ *    translated by `error.middleware.ts` into an HTTP `409 Conflict`.
+ * 
+ * 2. TRANSACTIONAL OUTBOX PATTERN:
+ *    To ensure asynchronous side-effects (confirmation emails, 24-hour reminders)
+ *    are never lost if the messaging broker or network experiences a hiccup,
+ *    we persist the event row to the `outbox` table in the SAME transaction.
+ * 
+ * 3. EVENT-DRIVEN CACHE INVALIDATION (Week 5):
+ *    Upon successful creation, cancellation, or reschedule of a booking,
+ *    we invalidate the Redis slot cache for that tenant:
+ *    `cacheService.delPattern("tenant:{tenantId}:slots:*")`.
+ * 
+ * 4. 24-HOUR CANCELLATION & REFUND POLICY:
+ *    If cancelled >= 24h prior to appointment start time: deposit eligible for refund.
+ *    If cancelled < 24h prior: deposit forfeited as per salon policy.
+ */
 
-export interface CreateBookingInput {
-  serviceId: string;
-  staffId: string;
-  startAt: string;
-  customerName: string;
-  customerEmail: string;
-  customerPhone?: string;
-  notes?: string;
-  customerId?: string;
-}
+import { db } from '../../config/database';
+import { cacheService } from '../../services/cache.service';
 
 export class BookingService {
-  async createBooking(tenantId: string, input: CreateBookingInput) {
-    const { serviceId, staffId, startAt, customerName, customerEmail, customerPhone, notes, customerId } = input;
+  async createBooking(tenantId: string, data: {
+    customerId?: string;
+    staffId: string;
+    serviceId: string;
+    startAt: string; // ISO 8601 string
+    customerName: string;
+    customerEmail: string;
+    customerPhone?: string;
+    notes?: string;
+  }) {
+    const { customerId, staffId, serviceId, startAt, customerName, customerEmail, customerPhone, notes } = data;
 
-    // 1. Fetch service to calculate endAt, price, deposit
+    // 1. Fetch service details to determine duration & deposit requirements
     const serviceRes = await db.query(
       'SELECT * FROM services WHERE tenant_id = $1 AND id = $2 AND is_active = TRUE',
       [tenantId, serviceId]
     );
     if (serviceRes.rows.length === 0) {
-      const err: any = new Error('Service not found');
+      const err: any = new Error('Service not found or inactive');
       err.statusCode = 404;
       err.name = 'SERVICE_NOT_FOUND';
       throw err;
     }
     const service = serviceRes.rows[0];
 
-    // Check custom staff duration/price if assigned
+    // Check custom staff duration/price override if any
     const staffServiceRes = await db.query(
-      'SELECT custom_duration_min, custom_price FROM staff_services WHERE staff_id = $1 AND service_id = $2',
-      [staffId, serviceId]
+      'SELECT custom_duration_min, custom_price FROM staff_services WHERE tenant_id = $1 AND staff_id = $2 AND service_id = $3',
+      [tenantId, staffId, serviceId]
     );
-    const custom = staffServiceRes.rows[0] || {};
-    const duration = custom.custom_duration_min || service.duration_min;
-    const totalPrice = custom.custom_price || service.price;
+    const duration = staffServiceRes.rows[0]?.custom_duration_min || service.duration_min;
+    const totalPrice = staffServiceRes.rows[0]?.custom_price || service.price;
     const depositAmount = service.deposit_amount || 0;
 
     const startDate = new Date(startAt);
     const endDate = new Date(startDate.getTime() + duration * 60 * 1000);
 
     // 2. Perform transactional insertion with PostgreSQL Exclusion Constraint & Outbox row
-    return db.transaction(async (client) => {
+    const result = await db.transaction(async (client) => {
       // Insertion into bookings table:
       // If another transaction inserted an overlapping time for this staff_id,
       // PostgreSQL throws 23P01 (exclusion_violation)
@@ -71,7 +99,7 @@ export class BookingService {
       );
       const booking = bookingRes.rows[0];
 
-      // 3. Write event to Transactional Outbox
+      // 3. Write event to Transactional Outbox atomically
       await client.query(
         `INSERT INTO outbox (tenant_id, aggregate_type, aggregate_id, event_type, payload)
          VALUES ($1, 'BOOKING', $2, 'booking.created.pending', $3)`,
@@ -83,6 +111,7 @@ export class BookingService {
             tenantId,
             staffId,
             serviceId,
+            serviceName: service.name,
             customerEmail,
             customerName,
             startAt: booking.start_at,
@@ -93,6 +122,11 @@ export class BookingService {
 
       return booking;
     });
+
+    // Event-driven cache invalidation: purge stale slots so other users immediately see this slot as taken
+    await cacheService.delPattern(cacheService.buildKey(tenantId, 'slots', '*'));
+
+    return result;
   }
 
   async getBookingById(tenantId: string, bookingId: string) {
@@ -161,7 +195,7 @@ export class BookingService {
 
     const isEligibleForRefund = hoursUntilBooking >= windowHours;
 
-    return db.transaction(async (client) => {
+    const outcome = await db.transaction(async (client) => {
       const res = await client.query(
         `UPDATE bookings
          SET status = 'CANCELLED', cancellation_reason = $1, updated_at = NOW()
@@ -170,7 +204,7 @@ export class BookingService {
         [cancellationReason || 'Customer requested cancellation', bookingId, tenantId]
       );
 
-      // Write outbox event for cancellation & refund processing
+      // Write outbox event for cancellation & refund notification
       await client.query(
         `INSERT INTO outbox (tenant_id, aggregate_type, aggregate_id, event_type, payload)
          VALUES ($1, 'BOOKING', $2, 'booking.cancelled', $3)`,
@@ -180,6 +214,10 @@ export class BookingService {
           JSON.stringify({
             bookingId,
             tenantId,
+            customerEmail: booking.customer_email,
+            customerName: booking.customer_name,
+            serviceName: booking.service_name,
+            startAt: booking.start_at,
             isEligibleForRefund,
             hoursUntilBooking,
             cancellationReason,
@@ -195,6 +233,11 @@ export class BookingService {
           : `Cancelled within ${windowHours} hours of appointment; deposit forfeited as per salon policy.`,
       };
     });
+
+    // Invalidate slot cache: slot is now freed up for other customers to reserve!
+    await cacheService.delPattern(cacheService.buildKey(tenantId, 'slots', '*'));
+
+    return outcome;
   }
 
   async rescheduleBooking(tenantId: string, bookingId: string, newStartAt: string) {
@@ -211,7 +254,7 @@ export class BookingService {
     const newStart = new Date(newStartAt);
     const newEnd = new Date(newStart.getTime() + durationMs);
 
-    return db.transaction(async (client) => {
+    const outcome = await db.transaction(async (client) => {
       // PostgreSQL Exclusion Constraint will check the updated slot against active bookings!
       const res = await client.query(
         `UPDATE bookings
@@ -230,6 +273,9 @@ export class BookingService {
           JSON.stringify({
             bookingId,
             tenantId,
+            customerEmail: booking.customer_email,
+            customerName: booking.customer_name,
+            serviceName: booking.service_name,
             oldStartAt: booking.start_at,
             newStartAt: newStart.toISOString(),
           }),
@@ -238,6 +284,11 @@ export class BookingService {
 
       return res.rows[0];
     });
+
+    // Invalidate slot cache
+    await cacheService.delPattern(cacheService.buildKey(tenantId, 'slots', '*'));
+
+    return outcome;
   }
 }
 
